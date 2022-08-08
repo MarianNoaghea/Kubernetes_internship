@@ -808,6 +808,70 @@ func TestStaticPolicyReuseCPUs(t *testing.T) {
 	}
 }
 
+func TestStaticPolicyReuseIsolatedCPUs(t *testing.T) {
+	testCases := []struct {
+		staticPolicyTest
+		expCSetAfterAlloc  cpuset.CPUSet
+		expCSetAfterRemove cpuset.CPUSet
+	}{
+		{
+			staticPolicyTest: staticPolicyTest{
+				description: "SingleSocketHT, DeAllocOneInitContainer",
+				topo:        topoIsolatedSingleSocketHT,
+				pod: makeMultiContainerPod(
+					[]struct{ request, limit string }{
+						{"4000m", "4000m"}}, // 2, 3, 4, 7
+					[]struct{ request, limit string }{
+						{"2000m", "2000m"}}), // 1, 5
+				containerName:   "initContainer-0",
+				stAssignments:   state.ContainerCPUAssignments{},
+				stDefaultCPUSet: cpuset.NewCPUSet(0, 1, 2, 3, 4, 5, 6, 7),
+			},
+			expCSetAfterAlloc:  cpuset.NewCPUSet(0, 6),
+			expCSetAfterRemove: cpuset.NewCPUSet(0, 2, 3, 4, 6, 7),
+		},
+	}
+
+	for _, testCase := range testCases {
+		policy, _ := NewStaticPolicy(testCase.topo, testCase.numReservedCPUs, cpuset.NewCPUSet(), topologymanager.NewFakeManager(), nil)
+
+		isolatedCPU := cpuset.NewBuilder()
+		isolatedCPU.Add(2)
+
+		newListOfAvailableCPUs := policy.GetCPUsIsolatedAvailable()
+		newListOfAvailableCPUs = newListOfAvailableCPUs.Union(isolatedCPU.Result())
+
+		policy.SetCPUsIsolatedAvailable(newListOfAvailableCPUs)
+
+		st := &mockState{
+			assignments:   testCase.stAssignments,
+			defaultCPUSet: testCase.stDefaultCPUSet,
+		}
+		pod := testCase.pod
+
+		// allocate
+		for _, container := range append(pod.Spec.InitContainers, pod.Spec.Containers...) {
+			policy.Allocate(st, pod, &container)
+		}
+		if !reflect.DeepEqual(st.defaultCPUSet, testCase.expCSetAfterAlloc) {
+			t.Errorf("StaticPolicy Allocate() error (%v). expected default cpuset %v but got %v",
+				testCase.description, testCase.expCSetAfterAlloc, st.defaultCPUSet)
+		}
+
+		// remove
+		policy.RemoveContainer(st, string(pod.UID), testCase.containerName)
+
+		if !reflect.DeepEqual(st.defaultCPUSet, testCase.expCSetAfterRemove) {
+			t.Errorf("StaticPolicy RemoveContainer() error (%v). expected default cpuset %v but got %v",
+				testCase.description, testCase.expCSetAfterRemove, st.defaultCPUSet)
+		}
+		if _, found := st.assignments[string(pod.UID)][testCase.containerName]; found {
+			t.Errorf("StaticPolicy RemoveContainer() error (%v). expected (pod %v, container %v) not be in assignments %v",
+				testCase.description, testCase.podUID, testCase.containerName, st.assignments)
+		}
+	}
+}
+
 func TestStaticPolicyRemove(t *testing.T) {
 	testCases := []staticPolicyTest{
 		{
